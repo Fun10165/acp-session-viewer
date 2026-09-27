@@ -10,9 +10,19 @@ TOML 结构：
 
 from __future__ import annotations
 
+import os
+import secrets
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+
+DEFAULT_SERVER_URL = "http://127.0.0.1:8787"
+DEFAULT_BIND = "127.0.0.1:8787"
+DEFAULT_PORT = 8787
+DEFAULT_BUDGET = 12000
+DEFAULT_LIST_LIMIT = 30
+TOKEN_ENVIRONMENT_VARIABLE = "ACP_VIEW_TOKEN"
+SERVER_ENVIRONMENT_VARIABLE = "ACP_VIEW_SERVER"
 
 
 class AgentConfigError(RuntimeError):
@@ -83,3 +93,95 @@ def find_agent(agents: tuple[AgentSpec, ...], name: str) -> AgentSpec:
             return spec
     known = ", ".join(spec.name for spec in agents)
     raise AgentConfigError(f"未知 agent {name!r}；可用: {known}")
+
+
+def default_token_path() -> Path:
+    """默认的令牌文件位置。"""
+    return Path.home() / ".config" / "acp-session-viewer" / "token"
+
+
+def parse_bind(value: str, *, default_port: int = DEFAULT_PORT) -> tuple[str, int]:
+    """解析 HOST、HOST:PORT、[IPv6]:PORT 三种绑定写法。"""
+    if not value:
+        raise AgentConfigError("绑定地址不能为空")
+    if value.startswith("["):
+        host, separator, rest = value[1:].partition("]")
+        if not separator:
+            raise AgentConfigError(f"IPv6 绑定地址缺少右方括号: {value!r}")
+        if rest == "":
+            address = (host, default_port)
+        elif rest.startswith(":"):
+            address = (host, _parse_port(rest[1:], value))
+        else:
+            raise AgentConfigError(f"绑定地址格式错误: {value!r}")
+    elif value.count(":") == 1:
+        host, port_text = value.split(":")
+        address = (host, _parse_port(port_text, value))
+    elif ":" in value:
+        raise AgentConfigError(f"IPv6 地址请写成 [地址]:端口 的形式: {value!r}")
+    else:
+        address = (value, default_port)
+    if not address[0]:
+        raise AgentConfigError(f"绑定地址缺少主机部分: {value!r}")
+    return address
+
+
+def _parse_port(text: str, source: str) -> int:
+    if not text.isdigit():
+        raise AgentConfigError(f"端口必须是数字: {source!r}")
+    port = int(text)
+    if not 1 <= port <= 65535:
+        raise AgentConfigError(f"端口超出 1-65535: {source!r}")
+    return port
+
+
+def generate_token() -> str:
+    """生成一个新的访问令牌。"""
+    return secrets.token_urlsafe(32)
+
+
+def load_token(path: Path) -> str | None:
+    """读取令牌文件；文件不存在或内容为空时返回 None。"""
+    if not path.is_file():
+        return None
+    token = path.read_text(encoding="utf-8").strip()
+    return token or None
+
+
+def save_token(path: Path, token: str) -> None:
+    """写入令牌文件，权限固定为 0600。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(token + "\n")
+
+
+def resolve_token(explicit: str | None, path: Path) -> str:
+    """客户端取令牌：参数优先，其次环境变量，最后令牌文件。"""
+    if explicit:
+        return explicit
+    from_environment = os.environ.get(TOKEN_ENVIRONMENT_VARIABLE)
+    if from_environment:
+        return from_environment
+    stored = load_token(path)
+    if stored:
+        return stored
+    raise AgentConfigError(
+        f"没有可用的令牌：请用 --token 指定，或设置 {TOKEN_ENVIRONMENT_VARIABLE} 环境变量，"
+        f"或先由服务端生成 {path}"
+    )
+
+
+def resolve_server_token(explicit: str | None, path: Path) -> tuple[str, str]:
+    """服务端取令牌，取不到时新生成并写入令牌文件，返回（令牌, 来源说明）。"""
+    if explicit:
+        return explicit, "--token 参数"
+    from_environment = os.environ.get(TOKEN_ENVIRONMENT_VARIABLE)
+    if from_environment:
+        return from_environment, f"环境变量 {TOKEN_ENVIRONMENT_VARIABLE}"
+    stored = load_token(path)
+    if stored:
+        return stored, f"令牌文件 {path}"
+    generated = generate_token()
+    save_token(path, generated)
+    return generated, f"新生成并写入 {path}"

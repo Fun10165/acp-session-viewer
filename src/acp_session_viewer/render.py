@@ -25,6 +25,23 @@ class RenderOptions:
     truncate: int = 400
 
 
+def apply_budget(text: str, budget: int) -> tuple[str, int]:
+    """把文本压到 budget 个字符以内，返回（结果, 丢弃字符数）。budget 为 0 或负数表示不限制。
+
+    截断提示行本身也计入上界，因此结果的长度按构造不超过 budget。
+    """
+    if budget <= 0 or len(text) <= budget:
+        return text, 0
+    template = "\n…（已截断，丢弃 {dropped} 字符；调大 --budget 或改用 --json 查看完整内容）"
+    reserved = len(template.format(dropped=len(text)))
+    if budget <= reserved:
+        marker = "…（预算过小，无法显示内容）"
+        return marker[:budget], len(text)
+    keep = budget - reserved
+    dropped = len(text) - keep
+    return text[:keep] + template.format(dropped=dropped), dropped
+
+
 def _shorten(text: str, limit: int) -> str:
     if limit <= 0 or len(text) <= limit:
         return text

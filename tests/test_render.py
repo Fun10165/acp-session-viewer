@@ -1,10 +1,12 @@
-"""渲染器的行为测试，以及只读客户端的拒绝行为。"""
+"""渲染器与字符上界的行为测试，以及只读客户端的拒绝行为。"""
 
 from __future__ import annotations
 
 import asyncio
 
-from acp_session_viewer.render import RenderOptions, content_block_text, render_transcript
+import pytest
+
+from acp_session_viewer.render import RenderOptions, apply_budget, content_block_text, render_transcript
 from acp_session_viewer.viewer import ReadOnlyClient
 
 
@@ -62,7 +64,7 @@ def test_工具调用与更新都会渲染状态() -> None:
     assert "[工具] 读取文件  (in_progress)" in text
     assert '输入: {"path": "a.py"}' in text
     assert "[工具] 读取文件 → completed" in text
-    assert "输出: \"ok\"" in text
+    assert '输出: "ok"' in text
 
 
 def test_工具更新在没有标题时沿用首次标题() -> None:
@@ -99,7 +101,7 @@ def test_元信息默认隐藏_打开后显示() -> None:
     assert "[元信息] 当前模式: plan" in shown
 
 
-def test_未知事件显式标出而不是丢弃() -> None:
+def test_未知事件显式标出_不静默丢弃() -> None:
     text = render_transcript([{"sessionUpdate": "品牌新事件", "value": 1}])
     assert text.startswith("[未知事件 品牌新事件]")
 
@@ -127,3 +129,24 @@ def test_只读客户端拒绝权限申请() -> None:
     response = asyncio.run(client.request_permission(session_id="s", tool_call={}, options=[]))
     assert response.outcome.outcome == "cancelled"
     assert client.refused_requests == ["session/request_permission"]
+
+
+def test_预算内与不限预算时原样返回() -> None:
+    assert apply_budget("abc", 10) == ("abc", 0)
+    assert apply_budget("abc", 0) == ("abc", 0)
+    assert apply_budget("", 5) == ("", 0)
+
+
+def test_恰好等于上界时不截断() -> None:
+    text = "甲" * 100
+    assert apply_budget(text, 100) == (text, 0)
+
+
+@pytest.mark.parametrize("budget", [1, 10, 45, 60, 100, 1000, 4999])
+def test_截断后长度不超过上界且说明丢弃量(budget: int) -> None:
+    text = "甲" * 5000
+    bounded, dropped = apply_budget(text, budget)
+    assert len(bounded) <= budget
+    assert 0 < dropped <= len(text)
+    if budget > 60:
+        assert f"丢弃 {dropped} 字符" in bounded

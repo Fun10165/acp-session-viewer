@@ -1,11 +1,12 @@
 [project]
 name = "acp-session-viewer"
-version = "0.1.0"
+version = "0.2.0"
 description = "用 ACP 协议只读查看各家 coding agent 的会话"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "agent-client-protocol>=0.12.1",
+    "aiohttp>=3.14.3",
 ]
 
 [project.scripts]
