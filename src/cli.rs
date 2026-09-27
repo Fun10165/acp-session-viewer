@@ -131,6 +131,9 @@ struct ServeArgs {
     /// 不打印访问日志
     #[arg(long)]
     quiet: bool,
+    /// 判定模式：rules（规则 + 权限）或 time-window（只按时间段放行，关闭权限系统）
+    #[arg(long, value_name = "MODE")]
+    policy_mode: Option<String>,
 }
 
 #[derive(Args)]
@@ -420,6 +423,16 @@ async fn run_serve(args: ServeArgs, config_path: Option<PathBuf>) -> ExitCode {
     config.server.timeout_secs = args.timeout;
     config.server.idle_timeout_secs = args.idle_timeout;
     config.server.max_uses_per_connection = args.max_uses;
+    if let Some(mode) = &args.policy_mode {
+        config.policy.mode = match mode.as_str() {
+            "rules" => crate::policy::PolicyMode::Rules,
+            "time-window" => crate::policy::PolicyMode::TimeWindow,
+            other => {
+                eprintln!("配置错误: 未知的判定模式 {other:?}（可用 rules 或 time-window）");
+                return ExitCode::from(EXIT_ERROR);
+            }
+        };
+    }
 
     let addr = match parse_bind(&config.server.bind, DEFAULT_PORT) {
         Ok(addr) => addr,
@@ -467,15 +480,22 @@ async fn run_serve(args: ServeArgs, config_path: Option<PathBuf>) -> ExitCode {
         "连接池: 空闲 {:.0} 秒回收，单条连接最多 {} 次操作后轮换",
         args.idle_timeout, args.max_uses
     );
-    println!(
-        "可见性策略: 默认 {}，拒绝规则 {} 条，放行规则 {} 条",
-        match service.config().policy.default {
-            crate::policy::Decision::Allow => "放行",
-            crate::policy::Decision::Deny => "拒绝",
-        },
-        service.config().policy.deny.len(),
-        service.config().policy.allow.len()
-    );
+    match service.mode() {
+        crate::policy::PolicyMode::Rules => println!(
+            "判定模式: rules（默认 {}，拒绝规则 {} 条，放行规则 {} 条，权限系统开启）",
+            match service.config().policy.default {
+                crate::policy::Decision::Allow => "放行",
+                crate::policy::Decision::Deny => "拒绝",
+            },
+            service.config().policy.deny.len(),
+            service.config().policy.allow.len()
+        ),
+        crate::policy::PolicyMode::TimeWindow => println!(
+            "判定模式: time-window（只看时间段：btime {} / mtime {}，权限系统关闭）",
+            service.config().policy.window.btime_after.as_deref().unwrap_or("不限"),
+            service.config().policy.window.mtime_after.as_deref().unwrap_or("不限")
+        ),
+    }
     if !addr.ip().is_loopback() {
         println!("警告: 绑定在非回环地址，凡是能访问该端口并持有令牌的人都可以读取被放行的会话内容");
     }
@@ -696,6 +716,7 @@ async fn run_policy(args: PolicyArgs, config_path: Option<PathBuf>) -> ExitCode 
     match args.command {
         PolicyCommand::Status { limit } => match service.policy_status(limit) {
             Ok((total, allowed, logged, recent)) => {
+                println!("# 判定模式：{}", service.mode().as_str());
                 println!("# 台账：{total} 条会话，其中放行 {allowed} 条；访问记录 {logged} 条");
                 let mut rows = Vec::new();
                 for (agent, session, decision, rule, reason) in recent {
@@ -787,6 +808,9 @@ async fn run_acl(args: AclArgs, config_path: Option<PathBuf>) -> ExitCode {
         AclCommand::Show { agent, session } => match service.acl_status(&agent, &session) {
             Ok((acl, source)) => {
                 print_acl(&acl, &source);
+                if service.mode() == crate::policy::PolicyMode::TimeWindow {
+                    println!("注意: 当前是 time-window 简单模式，权限位不参与判定");
+                }
                 ExitCode::SUCCESS
             }
             Err(error) => {

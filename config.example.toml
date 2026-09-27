@@ -48,11 +48,22 @@ name = "omp"
 command = ["omp", "acp"]
 description = "omp 自带的 ACP 服务端"
 
-# 可见性策略：默认不暴露任何会话，由规则决定放行谁。
+# 可见性判定模式：
+#   rules       —— 默认。规则判定 + 权限位（属主 / 属组 / 模式位）
+#   time-window —— 简单模式：关掉规则与权限判定，只用时间段放行
 [policy]
+mode = "rules"
 default = "deny"
-# 被拒绝过的会话是否永久不再暴露（推荐保持 true）
+# 被拒绝过的会话是否永久不再暴露（推荐保持 true，只在 rules 模式下生效）
 sticky_deny = true
+
+# 简单模式（mode = "time-window"）的时间段条件：给出的条件都要满足。
+#   btime —— 台账里的首次见到时间
+#   mtime —— agent 报告的更新时间（取不到时用最后见到时间）
+# 时间写法：RFC3339 或相对时长（-7d、-24h），不支持 rule-created。
+# [policy.window]
+# btime_after = "-30d"
+# mtime_after = "-7d"
 
 # 规则条件之间是「与」的关系；判定顺序是：历史拒绝 → deny 规则 → allow 规则 → 默认策略。
 

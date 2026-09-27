@@ -20,7 +20,7 @@ use crate::acl::{Access as AclAccess, ObjectAcl, Principal, check as acl_check};
 use crate::catalog::{AccessEntry, Catalog, CatalogError, GroupUpdate};
 use crate::config::{AgentSpec, Config};
 use crate::locate;
-use crate::policy::{Decision, Policy, SessionFacts, format_time};
+use crate::policy::{Decision, Policy, PolicyMode, SessionFacts, TimeWindow, format_time};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
@@ -90,6 +90,8 @@ pub struct AgentFailure {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionsReport {
+    /// 当前的判定模式：rules 或 time-window。
+    pub mode: String,
     pub sessions: Vec<SessionView>,
     pub total: usize,
     /// 被可见性策略隐藏的条数。
@@ -154,7 +156,6 @@ struct Evaluated {
     decision: Decision,
     rule: Option<String>,
     reason: String,
-    acl: ObjectAcl,
     acl_reason: String,
 }
 
@@ -213,6 +214,8 @@ pub fn match_summaries(summaries: &[SessionSummary], selector: &str) -> Vec<Sess
 pub struct Service {
     config: Config,
     policy: Policy,
+    mode: PolicyMode,
+    window: TimeWindow,
     catalog: Catalog,
     pool: Arc<AgentPool>,
     current_uid: u32,
@@ -229,6 +232,10 @@ impl Service {
     pub fn new(config: Config) -> Result<Self, ServiceError> {
         let policy = Policy::compile(&config.policy).map_err(|error| {
             ServiceError::BadRequest(format!("可见性策略不合法：{error}"))
+        })?;
+        let mode = config.policy.mode;
+        let window = TimeWindow::compile(&config.policy.window).map_err(|error| {
+            ServiceError::BadRequest(format!("时间段窗口配置不合法：{error}"))
         })?;
         let catalog = Catalog::open(&config.server.catalog_path().map_err(|error| {
             ServiceError::BadRequest(error.to_string())
@@ -258,6 +265,8 @@ impl Service {
         Ok(Self {
             config,
             policy,
+            mode,
+            window,
             catalog,
             pool,
             current_uid,
@@ -265,6 +274,12 @@ impl Service {
             acl_overrides,
             file_indexes: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
         })
+    }
+
+    /// 当前判定模式，供接口与命令展示。
+    #[must_use]
+    pub fn mode(&self) -> PolicyMode {
+        self.mode
     }
 
     /// 某个 agent 的会话文件索引（文件名 → 路径），60 秒内复用。
@@ -480,6 +495,7 @@ impl Service {
         )?;
 
         Ok(SessionsReport {
+            mode: self.mode.as_str().to_string(),
             sessions: views,
             total,
             hidden,
@@ -851,6 +867,7 @@ impl Service {
             &initial_acl,
             now,
         )?;
+        let acl_enforced = self.mode == PolicyMode::Rules;
         let mut acl = self.acl_for(&spec.name, &summary.session_id, Some(&record.acl));
         // 属主默认来自模板；能定位到会话文件时改用文件属主（配置覆盖与 chown 过的都保持原样）。
         let override_key = format!("{}/{}", spec.name, summary.session_id);
@@ -868,7 +885,15 @@ impl Service {
                 acl.owner = owner;
             }
         }
-        let acl_decision = acl_check(principal, &acl, access);
+        let acl_decision = if acl_enforced {
+            acl_check(principal, &acl, access)
+        } else {
+            crate::acl::AclDecision {
+                allowed: true,
+                class: "disabled",
+                reason: "简单模式：不做权限判定".into(),
+            }
+        };
         let file = self.file_facts(&spec.name, &summary.session_id, record.file_path.as_deref());
         let facts = SessionFacts {
             agent: spec.name.clone(),
@@ -880,25 +905,31 @@ impl Service {
             last_seen: record.last_seen,
             file,
         };
-        let outcome = self.policy.evaluate(
-            &facts,
-            record.remembered(),
-            |rule| self.catalog.rule_first_applied(rule, now).ok(),
-            now,
-            self.current_uid,
-        );
-        let changed = record.decision != Some(outcome.decision)
-            || record.rule != outcome.rule
-            || record.reason != outcome.reason;
-        if changed {
-            self.catalog.record_decision(
-                &spec.name,
-                &summary.session_id,
-                outcome.decision,
-                outcome.rule.as_deref(),
-                &outcome.reason,
+        let outcome = match self.mode {
+            PolicyMode::Rules => self.policy.evaluate(
+                &facts,
+                record.remembered(),
+                |rule| self.catalog.rule_first_applied(rule, now).ok(),
                 now,
-            )?;
+                self.current_uid,
+            ),
+            // 简单模式：只看时间段，不写判定记录，因此切回完整模式时不会留下「历史拒绝」。
+            PolicyMode::TimeWindow => self.window.evaluate(&facts, now),
+        };
+        if acl_enforced {
+            let changed = record.decision != Some(outcome.decision)
+                || record.rule != outcome.rule
+                || record.reason != outcome.reason;
+            if changed {
+                self.catalog.record_decision(
+                    &spec.name,
+                    &summary.session_id,
+                    outcome.decision,
+                    outcome.rule.as_deref(),
+                    &outcome.reason,
+                    now,
+                )?;
+            }
         }
         Ok(Evaluated {
             view: SessionView {
@@ -919,7 +950,6 @@ impl Service {
             decision: outcome.decision,
             rule: outcome.rule,
             reason: outcome.reason,
-            acl,
             acl_reason: acl_decision.reason,
         })
     }

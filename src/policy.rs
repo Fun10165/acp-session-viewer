@@ -95,6 +95,120 @@ pub enum OwnerSpec {
     Uid(u32),
 }
 
+/// 可见性判定的两种模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PolicyMode {
+    /// 完整模式：规则判定 + 权限位（属主 / 属组 / 模式位）。
+    Rules,
+    /// 简单模式：关掉规则与权限判定，只用时间段放行。
+    TimeWindow,
+}
+
+impl PolicyMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicyMode::Rules => "rules",
+            PolicyMode::TimeWindow => "time-window",
+        }
+    }
+}
+
+/// 简单模式的时间段条件；缺省的条件不限制。
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WindowConfig {
+    /// 首次见到时间（btime 的近似）下界。
+    pub btime_after: Option<String>,
+    pub btime_before: Option<String>,
+    /// 更新时间（mtime 的近似）下界。
+    pub mtime_after: Option<String>,
+    pub mtime_before: Option<String>,
+}
+
+/// 编译后的时间段。
+#[derive(Debug, Clone)]
+pub struct TimeWindow {
+    btime_after: Option<TimeSpec>,
+    btime_before: Option<TimeSpec>,
+    mtime_after: Option<TimeSpec>,
+    mtime_before: Option<TimeSpec>,
+}
+
+impl TimeWindow {
+    pub fn compile(config: &WindowConfig) -> Result<Self, PolicyError> {
+        // 简单模式没有规则，因此不接受 rule-created 这个写法。
+        let bound = |value: &Option<String>| -> Result<Option<TimeSpec>, PolicyError> {
+            let spec = compile_time("time-window", value)?;
+            if matches!(spec, Some(TimeSpec::RuleCreated)) {
+                return Err(PolicyError::BadTime {
+                    rule: "time-window".into(),
+                    value: "rule-created".into(),
+                });
+            }
+            Ok(spec)
+        };
+        Ok(Self {
+            btime_after: bound(&config.btime_after)?,
+            btime_before: bound(&config.btime_before)?,
+            mtime_after: bound(&config.mtime_after)?,
+            mtime_before: bound(&config.mtime_before)?,
+        })
+    }
+
+    /// 是否配置了任何条件；都没有时等于全部放行。
+    #[must_use]
+    pub fn is_unbounded(&self) -> bool {
+        self.btime_after.is_none()
+            && self.btime_before.is_none()
+            && self.mtime_after.is_none()
+            && self.mtime_before.is_none()
+    }
+
+    fn resolve(&self, spec: Option<TimeSpec>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        match spec {
+            None => None,
+            Some(TimeSpec::At(at)) => Some(at),
+            Some(TimeSpec::Relative(delta)) => Some(now - delta),
+            Some(TimeSpec::RuleCreated) => None,
+        }
+    }
+
+    /// 判定一条会话：所有给出的条件都要满足。
+    /// btime 用台账的首次见到时间，mtime 用 agent 报告的更新时间（缺失时用最后见到时间）。
+    #[must_use]
+    pub fn evaluate(&self, facts: &SessionFacts, now: DateTime<Utc>) -> Outcome {
+        let mtime = facts.updated_at.unwrap_or(facts.last_seen);
+        let checks: [(&str, Option<DateTime<Utc>>, DateTime<Utc>); 4] = [
+            ("btime 下界", self.resolve(self.btime_after, now), facts.first_seen),
+            ("btime 上界", self.resolve(self.btime_before, now), facts.first_seen),
+            ("mtime 下界", self.resolve(self.mtime_after, now), mtime),
+            ("mtime 上界", self.resolve(self.mtime_before, now), mtime),
+        ];
+        for (index, (label, limit, value)) in checks.iter().enumerate() {
+            let Some(limit) = limit else { continue };
+            let ok = if index % 2 == 0 { value >= limit } else { value <= limit };
+            if !ok {
+                return Outcome {
+                    decision: Decision::Deny,
+                    rule: None,
+                    reason: format!("时间段窗口：{label}不满足（{value} 相对 {limit}）"),
+                };
+            }
+        }
+        Outcome {
+            decision: Decision::Allow,
+            rule: None,
+            reason: format!(
+                "时间段窗口：btime {} 满足，mtime {} 满足",
+                format_time(facts.first_seen),
+                format_time(mtime)
+            ),
+        }
+    }
+}
+
 fn default_decision() -> Decision {
     Decision::Deny
 }
@@ -107,22 +221,34 @@ fn default_sticky() -> bool {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
+    /// 判定模式：rules（默认）或 time-window。
+    #[serde(default = "default_mode")]
+    pub mode: PolicyMode,
     #[serde(default = "default_decision")]
     pub default: Decision,
-    /// 被拒绝过的会话是否永久不再暴露。
+    /// 被拒绝过的会话是否永久不再暴露（只在 rules 模式下生效）。
     #[serde(default = "default_sticky")]
     pub sticky_deny: bool,
+    /// 简单模式的时间段条件。
+    #[serde(default)]
+    pub window: WindowConfig,
     #[serde(default)]
     pub deny: Vec<RuleConfig>,
     #[serde(default)]
     pub allow: Vec<RuleConfig>,
 }
 
+fn default_mode() -> PolicyMode {
+    PolicyMode::Rules
+}
+
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
+            mode: PolicyMode::Rules,
             default: Decision::Deny,
             sticky_deny: true,
+            window: WindowConfig::default(),
             deny: Vec::new(),
             allow: Vec::new(),
         }
@@ -973,6 +1099,75 @@ mod tests {
             rows[0].2,
             MatchOutcome::NotMatched("会话文件未定位到，文件条件无法判定".into())
         );
+    }
+
+    #[test]
+    fn 时间窗口按_btime_与_mtime_放行() {
+        let window = TimeWindow::compile(&WindowConfig {
+            btime_after: Some("-7d".into()),
+            mtime_after: Some("-24h".into()),
+            ..WindowConfig::default()
+        })
+        .unwrap();
+        let now = at("2026-09-27T12:00:00Z");
+        assert_eq!(window.evaluate(&facts(), now).decision, Decision::Allow);
+
+        // btime（首次见到）太早
+        let mut old = facts();
+        old.first_seen = at("2026-08-01T00:00:00Z");
+        assert_eq!(window.evaluate(&old, now).decision, Decision::Deny);
+
+        // mtime（更新时间）太早
+        let mut stale = facts();
+        stale.updated_at = Some(at("2026-09-01T00:00:00Z"));
+        assert_eq!(window.evaluate(&stale, now).decision, Decision::Deny);
+    }
+
+    #[test]
+    fn 时间窗口缺少更新时间时用最后见到时间() {
+        let window = TimeWindow::compile(&WindowConfig {
+            mtime_after: Some("-24h".into()),
+            ..WindowConfig::default()
+        })
+        .unwrap();
+        let now = at("2026-09-27T12:00:00Z");
+        let mut facts = facts();
+        facts.updated_at = None;
+        facts.last_seen = at("2026-09-27T06:00:00Z");
+        assert_eq!(window.evaluate(&facts, now).decision, Decision::Allow);
+
+        facts.last_seen = at("2026-09-01T00:00:00Z");
+        assert_eq!(window.evaluate(&facts, now).decision, Decision::Deny);
+    }
+
+    #[test]
+    fn 空窗口全部放行() {
+        let window = TimeWindow::compile(&WindowConfig::default()).unwrap();
+        assert!(window.is_unbounded());
+        assert_eq!(window.evaluate(&facts(), Utc::now()).decision, Decision::Allow);
+    }
+
+    #[test]
+    fn 时间窗口不接受_rule_created() {
+        assert!(matches!(
+            TimeWindow::compile(&WindowConfig {
+                btime_after: Some("rule-created".into()),
+                ..WindowConfig::default()
+            }),
+            Err(PolicyError::BadTime { .. })
+        ));
+    }
+
+    #[test]
+    fn 模式默认是规则模式并可从配置读出() {
+        assert_eq!(PolicyConfig::default().mode, PolicyMode::Rules);
+        let parsed: PolicyConfig = toml::from_str(
+            "mode = \"time-window\"\n[window]\nmtime_after = \"-7d\"\nbtime_after = \"-30d\"\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.mode, PolicyMode::TimeWindow);
+        assert_eq!(parsed.window.mtime_after.as_deref(), Some("-7d"));
+        assert_eq!(parsed.window.btime_after.as_deref(), Some("-30d"));
     }
 
     #[test]
