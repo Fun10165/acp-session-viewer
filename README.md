@@ -35,6 +35,7 @@ ACP 把会话做成了标准接口：
 uv run acp-view serve                             # 默认绑定 127.0.0.1:8787
 uv run acp-view serve --bind 0.0.0.0:8787         # 对外提供服务
 uv run acp-view serve --bind 127.0.0.1 --port 9000
+uv run acp-view serve --idle-timeout 60 --max-uses 16   # 调整连接回收与轮换策略
 ```
 
 令牌按以下顺序确定：`--token` 参数 → `ACP_VIEW_TOKEN` 环境变量 → 令牌文件（默认 `~/.config/acp-session-viewer/token`）。
@@ -63,7 +64,7 @@ uv run acp-view show 01a0e148 --json
 
 | 方法 | 路径 | 参数 | 说明 |
 | --- | --- | --- | --- |
-| GET | `/health` | | 返回 `{"ok": true, "version": ...}` |
+| GET | `/health` | | 返回版本与连接池状态（每个 agent 的连接、进程号、空闲秒数、使用次数）|
 | GET | `/agents` | | 各 agent 的实现名、能力与错误 |
 | GET | `/sessions` | `agent`（可重复）、`query`、`limit` | 会话列表，按更新时间倒序；`errors` 里列出被跳过的 agent |
 | GET | `/transcript` | `selector`（必填）、`agent`（可重复）、`cwd`、`format=json\|text`、`no_thoughts`、`meta`、`truncate`、`budget` | 重放一条会话；`text` 返回纯文本，`budget` 只对 `text` 生效 |
@@ -76,6 +77,29 @@ uv run acp-view show 01a0e148 --json
 - **退出码**：`0` 成功、`1` 失败、`2` 没有找到会话。
 - **选择器**：`show` 接受会话 ID、ID 前缀、标题子串、工作目录子串，或 `last`；命中多条时取更新时间最新的，并在输出里说明命中数量。
 - **显式错误**：连不上服务端、令牌缺失、agent 不支持所需能力都会直接报错，不静默返回空结果。
+
+## 连接复用
+
+服务端按 agent 维护长连接，跨请求复用，避免每次查询都付出冷启动开销：
+
+- 同一 agent 的操作串行执行，不同 agent 互不影响；
+- 连接空闲超过 `--idle-timeout`（默认 300 秒）后被回收任务关闭，用完即走的场景不会留下常驻进程；
+- 单条连接服务 `--max-uses`（默认 64）次操作后轮换，避免进程长期累积状态；
+- agent 进程中途退出时，丢弃旧连接并用新连接重试一次；操作层面的失败（例如 agent 不支持某能力）保留连接、直接上报。
+
+实测（本机，五个 agent）：
+
+| 请求 | 连接尚未建立 | 复用连接后 |
+| --- | --- | --- |
+| `GET /agents` 探测五个 agent | 1.50–1.84s | 0.32–0.35s |
+| `GET /sessions` 全量（1651 条会话，含分页）| 5.02s | 0.49s |
+| 重放同一条会话（omp，600 条事件）| 0.12s | 0.02s |
+
+表里的 `GET` 耗时包含命令行进程自身的启动与导入（约 0.3 秒），服务端部分在复用后接近零成本。
+重放时间是协议层测量值，不含命令行开销。
+
+冷启动的构成：omp 与 opencode 各约 0.15 秒，cursor 约 2.3 秒，codex 的 `npx` 解析约 2.9 秒；
+codex 与 cursor 在关闭标准输入后不会主动退出，收尾还会坐满 SDK 的 2 秒等待。复用连接后这些成本只在第一次出现。
 
 ## 实测支持矩阵
 
@@ -111,7 +135,8 @@ uv run acp-view show 01a0e148 --json
 - **opencode 的覆盖范围与迁移进度有关**：它正在把 v1 数据迁移到 v2，`session/list` 返回已迁移的部分，迁移游标会随 agent 启动而推进。
 - **启动 agent 会触发 agent 自身的写操作**：实测 opencode 每次启动都会推进它自己的迁移记录（数据库内容变化、大小不变）。客户端没有发送任何写请求。
 - **`--json` 输出经过 SDK 规范化**：协议模型之外的字段会被丢弃，输出不保证与线路上传输的字节完全一致。
-- **服务端不缓存**：每次请求都会重新启动涉及的 agent，因此 `list` 全量查询的耗时等于最慢 agent 的启动耗时之和的并行值。
+- **长时间空闲后仍需冷启动**：连接超过 `--idle-timeout` 会被回收，此后第一个请求要重新付出 agent 的启动成本。
+- **gemini 的连接只能用于按 ID 加载**：它不支持会话枚举，因此枚举类请求不会用到它的连接。
 
 ## 开发
 
@@ -122,12 +147,16 @@ uv run pytest
 代码结构：
 
 - `src/acp_session_viewer/config.py`：agent 注册表、绑定地址解析、令牌处理
-- `src/acp_session_viewer/viewer.py`：只读 ACP 客户端（探测、枚举、重放）
+- `src/acp_session_viewer/viewer.py`：只读 ACP 客户端与可复用的长连接
+- `src/acp_session_viewer/agent_pool.py`：按 agent 维护长连接（复用、空闲回收、轮换、失效重试）
 - `src/acp_session_viewer/render.py`：事件到文本的纯函数渲染，以及字符上界处理
 - `src/acp_session_viewer/selection.py`：会话选择器匹配规则（纯函数）
 - `src/acp_session_viewer/api.py`：服务层，把只读能力包装成报告结构
-- `src/acp_session_viewer/server.py`：HTTP 服务端（aiohttp）与令牌鉴权
+- `src/acp_session_viewer/server.py`：HTTP 服务端（aiohttp）、令牌鉴权与连接池装配
 - `src/acp_session_viewer/client.py`：HTTP 客户端
 - `src/acp_session_viewer/cli.py`：命令行入口
+
+测试：`tests/test_pool.py` 用 `tests/fixtures/stub_agent.py`（一个最小 ACP 服务端）核对连接的复用、
+轮换、空闲回收与进程退出后的恢复；`tests/test_server.py` 覆盖鉴权与错误映射。
 
 `scratch/` 存放中间产物，已被 git 忽略。

@@ -31,6 +31,7 @@ from .config import (
     parse_bind,
     resolve_server_token,
 )
+from .agent_pool import DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_USES
 from .render import apply_budget
 from .server import run_server
 
@@ -198,10 +199,19 @@ def _run_serve(args: argparse.Namespace) -> int:
     print(f"acp-view 服务端启动: http://{host}:{port}")
     print(f"令牌来源: {source}")
     print(f"可用 agent: {', '.join(spec.name for spec in agents)}")
+    print(f"连接池: 空闲 {args.idle_timeout:.0f} 秒回收，单条连接最多 {args.max_uses} 次操作后轮换")
     if host not in ("127.0.0.1", "localhost", "::1"):
         print("警告: 绑定在非回环地址，凡是能访问该端口并持有令牌的人都可以读取全部会话内容")
     try:
-        run_server(host=host, port=port, token=token, agents=agents, timeout=args.timeout)
+        run_server(
+            host=host,
+            port=port,
+            token=token,
+            agents=agents,
+            timeout=args.timeout,
+            idle_timeout=args.idle_timeout,
+            max_uses_per_connection=args.max_uses,
+        )
     except KeyboardInterrupt:
         return 130
     return EXIT_OK
@@ -227,6 +237,18 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--token-file", type=Path, help="令牌文件位置")
     serve.add_argument("--agents", metavar="FILE", help="agent 配置文件（TOML）")
     serve.add_argument("--timeout", type=float, default=180.0, help="每个 agent 操作的超时秒数")
+    serve.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=DEFAULT_IDLE_TIMEOUT,
+        help=f"agent 连接空闲多少秒后回收（默认 {DEFAULT_IDLE_TIMEOUT:.0f}）",
+    )
+    serve.add_argument(
+        "--max-uses",
+        type=int,
+        default=DEFAULT_MAX_USES,
+        help=f"单条连接最多服务多少次操作后轮换（默认 {DEFAULT_MAX_USES}）",
+    )
 
     health = subparsers.add_parser("health", parents=[common], help="检查服务端是否可用")  # noqa: F841
 

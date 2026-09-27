@@ -6,20 +6,30 @@
 * 初始化时声明空的能力集，agent 无法要求客户端读写文件或执行命令。
 * 服务端发来的任何反向请求一律拒绝：权限申请返回 cancelled，其余报"方法不存在"。
 * 不触碰任何 agent 的本地存储文件。
+
+``AgentConnection`` 是一条可复用的长连接（持有子进程与 ACP 连接），
+连接复用与空闲回收由 ``agent_pool.AgentPool`` 负责。
+``probe`` / ``list_sessions`` / ``load_transcript`` 三个函数是冷启动一次的便捷封装。
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+from contextlib import AsyncExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Sequence
+from typing import Any, Iterator, Sequence
 
 import acp
 from acp.core import DEFAULT_STDIO_BUFFER_LIMIT_BYTES
 from acp.schema import DeniedOutcome, Implementation, RequestPermissionResponse
 
+from . import __version__
 from .config import AgentSpec
+
+DEFAULT_TIMEOUT = 180.0
+DEFAULT_QUIET_PERIOD = 0.3
+MAX_LIST_PAGES = 20
 
 
 class ViewerError(RuntimeError):
@@ -92,122 +102,6 @@ def _dump(model: Any) -> dict[str, Any]:
     raise ViewerError(f"无法序列化的事件类型: {type(model)!r}")
 
 
-async def _run_with_agent(
-    spec: AgentSpec,
-    action: Callable[[acp.ClientSideConnection, ProbeResult, ReadOnlyClient], Awaitable[Any]],
-    *,
-    timeout: float,
-    need_list: bool = False,
-    need_load: bool = False,
-) -> Any:
-    """启动 agent、完成 initialize、执行动作，然后关闭进程。"""
-    client = ReadOnlyClient()
-    try:
-        async with asyncio.timeout(timeout):
-            async with acp.spawn_agent_process(
-                client,
-                *spec.command,
-                env=dict(os.environ),
-                transport_kwargs={"limit": DEFAULT_STDIO_BUFFER_LIMIT_BYTES},
-            ) as (connection, _process):
-                init = await connection.initialize(
-                    protocol_version=acp.PROTOCOL_VERSION,
-                    client_capabilities=None,
-                    client_info=Implementation(name="acp-session-viewer", title="ACP 会话查看器", version="0.1.0"),
-                )
-                init_data = _dump(init)
-                probe = ProbeResult(
-                    agent=spec,
-                    protocol_version=int(init_data.get("protocolVersion", acp.PROTOCOL_VERSION)),
-                    agent_info=init_data.get("agentInfo") or {},
-                    capabilities=init_data.get("agentCapabilities") or {},
-                    auth_methods=init_data.get("authMethods") or [],
-                )
-                if need_list and not probe.can_list:
-                    raise ViewerError(f"agent {spec.name} 未声明 sessionCapabilities.list，无法枚举会话")
-                if need_load and not probe.can_load:
-                    raise ViewerError(f"agent {spec.name} 未声明 loadSession，无法加载会话")
-                return await action(connection, probe, client)
-    except TimeoutError as exc:
-        raise ViewerError(f"agent {spec.name} 在 {timeout:.0f} 秒内没有完成响应") from exc
-    except FileNotFoundError as exc:
-        raise ViewerError(f"agent {spec.name} 的命令不存在: {' '.join(spec.command)}") from exc
-
-
-async def probe(spec: AgentSpec, *, timeout: float = 60.0) -> ProbeResult:
-    """只做 initialize，返回能力快照。"""
-
-    async def action(_connection: acp.ClientSideConnection, result: ProbeResult, _client: ReadOnlyClient) -> ProbeResult:
-        return result
-
-    return await _run_with_agent(spec, action, timeout=timeout)
-
-
-async def list_sessions(
-    spec: AgentSpec,
-    *,
-    timeout: float = 60.0,
-    max_pages: int = 20,
-) -> tuple[list[SessionSummary], ProbeResult]:
-    """分页枚举该 agent 的全部会话。"""
-    seen_cursors: set[str] = set()
-
-    async def action(
-        connection: acp.ClientSideConnection, result: ProbeResult, _client: ReadOnlyClient
-    ) -> tuple[list[SessionSummary], ProbeResult]:
-        summaries: list[SessionSummary] = []
-        cursor: str | None = None
-        for _ in range(max_pages):
-            response = _dump(await connection.list_sessions(cursor=cursor))
-            for item in response.get("sessions") or []:
-                summaries.append(
-                    SessionSummary(
-                        agent=spec.name,
-                        session_id=item["sessionId"],
-                        cwd=item.get("cwd", ""),
-                        title=item.get("title"),
-                        updated_at=item.get("updatedAt"),
-                    )
-                )
-            next_cursor = response.get("nextCursor")
-            if not next_cursor:
-                return summaries, result
-            if next_cursor in seen_cursors:
-                raise ViewerError(f"agent {spec.name} 返回了重复的翻页游标，已停止以避免死循环")
-            seen_cursors.add(next_cursor)
-            cursor = next_cursor
-        raise ViewerError(f"agent {spec.name} 的会话翻页超过 {max_pages} 页，已停止")
-
-    return await _run_with_agent(spec, action, timeout=timeout, need_list=True)
-
-
-async def load_transcript(
-    spec: AgentSpec,
-    session_id: str,
-    cwd: str,
-    *,
-    timeout: float = 120.0,
-    quiet_period: float = 0.3,
-) -> tuple[LoadResult, ProbeResult]:
-    """加载一条会话并收集重放的全部事件。"""
-
-    async def action(
-        connection: acp.ClientSideConnection, result: ProbeResult, client: ReadOnlyClient
-    ) -> tuple[LoadResult, ProbeResult]:
-        response = _dump(await connection.load_session(cwd=cwd, session_id=session_id))
-        await _wait_for_replay_tail(client, quiet_period=quiet_period)
-        load_result = LoadResult(
-            agent=spec.name,
-            session_id=session_id,
-            response=response,
-            updates=list(client.updates),
-            refused_requests=list(client.refused_requests),
-        )
-        return load_result, result
-
-    return await _run_with_agent(spec, action, timeout=timeout, need_load=True)
-
-
 async def _wait_for_replay_tail(client: ReadOnlyClient, *, quiet_period: float, max_wait: float = 5.0) -> None:
     """等重放事件全部到达：静默 quiet_period 秒后认为结束。
 
@@ -220,6 +114,211 @@ async def _wait_for_replay_tail(client: ReadOnlyClient, *, quiet_period: float, 
         await asyncio.sleep(quiet_period)
         if len(client.updates) == seen or loop.time() >= deadline:
             return
+
+
+@contextmanager
+def _translate_errors(agent_name: str, operation: str, timeout: float) -> Iterator[None]:
+    """把超时与传输层中断统一翻译成 ViewerError，避免它们以裸异常逃到上层。"""
+    try:
+        yield
+    except TimeoutError as exc:
+        raise ViewerError(f"agent {agent_name} {operation}超时（{timeout:.0f} 秒）") from exc
+    except (ConnectionError, EOFError, OSError) as exc:
+        raise ViewerError(f"agent {agent_name} 的连接中断: {exc}") from exc
+
+
+class AgentConnection:
+    """一条到 agent 的长连接：持有子进程与 ACP 连接，可以复用。"""
+
+    def __init__(self, spec: AgentSpec) -> None:
+        self.spec = spec
+        self.probe: ProbeResult | None = None
+        self.load_count = 0
+        self._client = ReadOnlyClient()
+        self._stack: AsyncExitStack | None = None
+        self._connection: acp.ClientSideConnection | None = None
+        self._process: Any = None
+
+    @property
+    def pid(self) -> int | None:
+        return None if self._process is None else self._process.pid
+
+    @property
+    def is_open(self) -> bool:
+        return self._connection is not None
+
+    @property
+    def alive(self) -> bool:
+        return self._process is not None and self._process.returncode is None
+
+    async def ensure_open(self, *, timeout: float = DEFAULT_TIMEOUT) -> ProbeResult:
+        """建立连接并完成初始化；已建立时直接返回能力快照。"""
+        if self.probe is not None:
+            return self.probe
+
+        stack = AsyncExitStack()
+        try:
+            connection, process = await stack.enter_async_context(
+                acp.spawn_agent_process(
+                    self._client,
+                    *self.spec.command,
+                    env=dict(os.environ),
+                    transport_kwargs={"limit": DEFAULT_STDIO_BUFFER_LIMIT_BYTES},
+                )
+            )
+            async with asyncio.timeout(timeout):
+                init = _dump(
+                    await connection.initialize(
+                        protocol_version=acp.PROTOCOL_VERSION,
+                        client_capabilities=None,
+                        client_info=Implementation(
+                            name="acp-session-viewer",
+                            title="ACP 会话查看器",
+                            version=__version__,
+                        ),
+                    )
+                )
+        except TimeoutError as exc:
+            await stack.aclose()
+            raise ViewerError(f"agent {self.spec.name} 在 {timeout:.0f} 秒内没有完成初始化") from exc
+        except FileNotFoundError as exc:
+            await stack.aclose()
+            raise ViewerError(f"agent {self.spec.name} 的命令不存在: {' '.join(self.spec.command)}") from exc
+        except Exception:
+            await stack.aclose()
+            raise
+
+        self._stack = stack
+        self._connection = connection
+        self._process = process
+        self.probe = ProbeResult(
+            agent=self.spec,
+            protocol_version=int(init.get("protocolVersion", acp.PROTOCOL_VERSION)),
+            agent_info=init.get("agentInfo") or {},
+            capabilities=init.get("agentCapabilities") or {},
+            auth_methods=init.get("authMethods") or [],
+        )
+        return self.probe
+
+    async def close(self) -> None:
+        """关闭连接与子进程。"""
+        stack, self._stack = self._stack, None
+        self._connection = None
+        self._process = None
+        self.probe = None
+        if stack is not None:
+            await stack.aclose()
+
+    async def _require_connection(self) -> acp.ClientSideConnection:
+        if self._connection is None:
+            raise ViewerError(f"agent {self.spec.name} 的连接尚未建立")
+        return self._connection
+
+    async def list_sessions(
+        self,
+        *,
+        timeout: float = DEFAULT_TIMEOUT,
+        max_pages: int = MAX_LIST_PAGES,
+    ) -> list[SessionSummary]:
+        """分页枚举该 agent 的全部会话。"""
+        if self.probe is None or not self.probe.can_list:
+            raise ViewerError(f"agent {self.spec.name} 未声明 sessionCapabilities.list，无法枚举会话")
+        connection = await self._require_connection()
+        summaries: list[SessionSummary] = []
+        seen_cursors: set[str] = set()
+        cursor: str | None = None
+        with _translate_errors(self.spec.name, "枚举会话", timeout):
+            async with asyncio.timeout(timeout):
+                for _ in range(max_pages):
+                    response = _dump(await connection.list_sessions(cursor=cursor))
+                    for item in response.get("sessions") or []:
+                        summaries.append(
+                            SessionSummary(
+                                agent=self.spec.name,
+                                session_id=item["sessionId"],
+                                cwd=item.get("cwd", ""),
+                                title=item.get("title"),
+                                updated_at=item.get("updatedAt"),
+                            )
+                        )
+                    next_cursor = response.get("nextCursor")
+                    if not next_cursor:
+                        return summaries
+                    if next_cursor in seen_cursors:
+                        raise ViewerError(f"agent {self.spec.name} 返回了重复的翻页游标，已停止以避免死循环")
+                    seen_cursors.add(next_cursor)
+                    cursor = next_cursor
+        raise ViewerError(f"agent {self.spec.name} 的会话翻页超过 {max_pages} 页，已停止")
+
+    async def load_transcript(
+        self,
+        session_id: str,
+        cwd: str,
+        *,
+        timeout: float = DEFAULT_TIMEOUT,
+        quiet_period: float = DEFAULT_QUIET_PERIOD,
+    ) -> LoadResult:
+        """加载一条会话并收集重放的全部事件。"""
+        if self.probe is None or not self.probe.can_load:
+            raise ViewerError(f"agent {self.spec.name} 未声明 loadSession，无法加载会话")
+        connection = await self._require_connection()
+        self._client.updates.clear()
+        self._client.refused_requests.clear()
+        with _translate_errors(self.spec.name, "加载会话", timeout):
+            async with asyncio.timeout(timeout):
+                response = _dump(await connection.load_session(cwd=cwd, session_id=session_id))
+                await _wait_for_replay_tail(self._client, quiet_period=quiet_period)
+        self.load_count += 1
+        return LoadResult(
+            agent=self.spec.name,
+            session_id=session_id,
+            response=response,
+            updates=list(self._client.updates),
+            refused_requests=list(self._client.refused_requests),
+        )
+
+
+async def probe(spec: AgentSpec, *, timeout: float = DEFAULT_TIMEOUT) -> ProbeResult:
+    """冷启动一次，只做初始化。"""
+    connection = AgentConnection(spec)
+    try:
+        return await connection.ensure_open(timeout=timeout)
+    finally:
+        await connection.close()
+
+
+async def list_sessions(
+    spec: AgentSpec,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    max_pages: int = MAX_LIST_PAGES,
+) -> tuple[list[SessionSummary], ProbeResult]:
+    """冷启动一次并枚举会话。"""
+    connection = AgentConnection(spec)
+    try:
+        result = await connection.ensure_open(timeout=timeout)
+        sessions = await connection.list_sessions(timeout=timeout, max_pages=max_pages)
+        return sessions, result
+    finally:
+        await connection.close()
+
+
+async def load_transcript(
+    spec: AgentSpec,
+    session_id: str,
+    cwd: str,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    quiet_period: float = DEFAULT_QUIET_PERIOD,
+) -> tuple[LoadResult, ProbeResult]:
+    """冷启动一次并重放一条会话。"""
+    connection = AgentConnection(spec)
+    try:
+        result = await connection.ensure_open(timeout=timeout)
+        transcript = await connection.load_transcript(session_id, cwd, timeout=timeout, quiet_period=quiet_period)
+        return transcript, result
+    finally:
+        await connection.close()
 
 
 def select_agents(agents: Sequence[AgentSpec], names: Sequence[str] | None) -> list[AgentSpec]:

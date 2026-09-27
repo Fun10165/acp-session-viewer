@@ -2,12 +2,12 @@
 
 接口一览（全部需要 ``Authorization: Bearer <token>``）：
 
-* ``GET /health`` —— 健康检查
+* ``GET /health`` —— 健康检查，附带连接池状态
 * ``GET /agents`` —— 各 agent 的 ACP 能力
 * ``GET /sessions?agent=&query=&limit=`` —— 会话列表
 * ``GET /transcript?selector=&agent=&cwd=&format=json|text`` —— 会话重放
 
-每个请求都会打印一行访问记录，便于事后核对谁在什么时候读了哪条会话。
+agent 连接由连接池维护，跨请求复用，空闲超过阈值后回收；每个请求都会打印一行访问记录。
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from typing import Any, Sequence
 from aiohttp import web
 
 from . import __version__
+from .agent_pool import DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_USES, AgentPool
 from .api import ApiError, agents_report, sessions_report, transcript_report
 from .config import AgentSpec
 from .render import RenderOptions, apply_budget, render_transcript
@@ -29,7 +30,7 @@ MAX_BUDGET = 10**9
 
 TOKEN_KEY: web.AppKey[str] = web.AppKey("token", str)
 AGENTS_KEY: web.AppKey[tuple[AgentSpec, ...]] = web.AppKey("agents", tuple)
-TIMEOUT_KEY: web.AppKey[float] = web.AppKey("timeout", float)
+POOL_KEY: web.AppKey[AgentPool] = web.AppKey("pool", AgentPool)
 LOG_REQUESTS_KEY: web.AppKey[bool] = web.AppKey("log_requests", bool)
 
 
@@ -97,8 +98,22 @@ def _bool_param(request: web.Request, name: str, default: bool) -> bool:
     raise ApiError(400, f"参数 {name} 必须是布尔值: {raw!r}")
 
 
+async def _start_pool(app: web.Application) -> None:
+    await app[POOL_KEY].start()
+
+
+async def _stop_pool(app: web.Application) -> None:
+    await app[POOL_KEY].close()
+
+
 async def _handle_health(request: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "version": __version__})
+    return web.json_response(
+        {
+            "ok": True,
+            "version": __version__,
+            "connections": request.app[POOL_KEY].status(),
+        }
+    )
 
 
 def _session_json(item: SessionSummary) -> dict[str, Any]:
@@ -113,7 +128,7 @@ def _session_json(item: SessionSummary) -> dict[str, Any]:
 
 
 async def _handle_agents(request: web.Request) -> web.Response:
-    reports = await agents_report(request.app[AGENTS_KEY], timeout=request.app[TIMEOUT_KEY])
+    reports = await agents_report(request.app[AGENTS_KEY], pool=request.app[POOL_KEY])
     return web.json_response({"agents": [asdict(report) for report in reports]})
 
 
@@ -125,7 +140,7 @@ async def _handle_sessions(request: web.Request) -> web.Response:
         selected = select_agents(request.app[AGENTS_KEY], names)
     except ViewerError as exc:
         raise ApiError(400, str(exc)) from exc
-    report = await sessions_report(selected, query=query, limit=limit, timeout=request.app[TIMEOUT_KEY])
+    report = await sessions_report(selected, query=query, limit=limit, pool=request.app[POOL_KEY])
     return web.json_response(
         {
             "sessions": [_session_json(item) for item in report.sessions],
@@ -154,7 +169,7 @@ async def _handle_transcript(request: web.Request) -> web.Response:
         selector=selector,
         agent_names=None,
         cwd=cwd,
-        timeout=request.app[TIMEOUT_KEY],
+        pool=request.app[POOL_KEY],
     )
 
     if output_format == "json":
@@ -189,23 +204,40 @@ def build_app(
     *,
     token: str,
     agents: Sequence[AgentSpec],
-    timeout: float,
+    pool: AgentPool,
     log_requests: bool = True,
 ) -> web.Application:
     """构造 aiohttp 应用，便于测试时单独装配。"""
     app = web.Application(middlewares=[_access_log, _require_token])
     app[TOKEN_KEY] = token
     app[AGENTS_KEY] = tuple(agents)
-    app[TIMEOUT_KEY] = timeout
+    app[POOL_KEY] = pool
     app[LOG_REQUESTS_KEY] = log_requests
     app.router.add_get("/health", _handle_health)
     app.router.add_get("/agents", _handle_agents)
     app.router.add_get("/sessions", _handle_sessions)
     app.router.add_get("/transcript", _handle_transcript)
+    app.on_startup.append(_start_pool)
+    app.on_cleanup.append(_stop_pool)
     return app
 
 
-def run_server(*, host: str, port: int, token: str, agents: Sequence[AgentSpec], timeout: float) -> None:
+def run_server(
+    *,
+    host: str,
+    port: int,
+    token: str,
+    agents: Sequence[AgentSpec],
+    timeout: float,
+    idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+    max_uses_per_connection: int = DEFAULT_MAX_USES,
+) -> None:
     """启动服务，直到收到中断信号。"""
-    app = build_app(token=token, agents=agents, timeout=timeout)
+    pool = AgentPool(
+        timeout=timeout,
+        idle_timeout=idle_timeout,
+        max_uses_per_connection=max_uses_per_connection,
+        log=lambda message: print(message, flush=True),
+    )
+    app = build_app(token=token, agents=agents, pool=pool)
     web.run_app(app, host=host, port=port, print=None, access_log=None)

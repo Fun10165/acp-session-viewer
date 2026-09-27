@@ -1,6 +1,6 @@
 """服务层：把只读 ACP 能力包装成可供 HTTP 层使用的报告结构。
 
-这一层只依赖 viewer 的只读接口，不含任何 HTTP 细节，便于单独测试。
+这一层只依赖连接池与只读接口，不含任何 HTTP 细节，便于单独测试。
 所有跨 agent 的操作并行执行，单个 agent 失败只记录到报告里，不影响其他 agent。
 """
 
@@ -10,9 +10,10 @@ import asyncio
 from dataclasses import dataclass
 from typing import Sequence
 
+from .agent_pool import AgentPool
 from .config import AgentSpec
 from .selection import match_sessions
-from .viewer import SessionSummary, ViewerError, list_sessions, load_transcript, probe, select_agents
+from .viewer import AgentConnection, ProbeResult, SessionSummary, ViewerError, select_agents
 
 
 class ApiError(RuntimeError):
@@ -61,12 +62,18 @@ class TranscriptReport:
     updates: list[dict]
 
 
-async def agents_report(agents: Sequence[AgentSpec], *, timeout: float) -> list[AgentReport]:
+async def _probe_of(connection: AgentConnection) -> ProbeResult:
+    if connection.probe is None:
+        raise ViewerError("连接尚未完成初始化")
+    return connection.probe
+
+
+async def agents_report(agents: Sequence[AgentSpec], *, pool: AgentPool) -> list[AgentReport]:
     """并行探测每个 agent 的 ACP 能力。"""
 
     async def one(spec: AgentSpec) -> AgentReport:
         try:
-            result = await probe(spec, timeout=timeout)
+            result = await pool.use(spec, _probe_of)
         except ViewerError as exc:
             return AgentReport(spec.name, "", spec.description, None, False, False, [], str(exc))
         info = result.agent_info
@@ -89,17 +96,15 @@ async def sessions_report(
     *,
     query: str | None,
     limit: int,
-    timeout: float,
+    pool: AgentPool,
 ) -> SessionsReport:
     """并行枚举全部会话，按关键词过滤后按更新时间倒序返回。"""
 
     async def one(spec: AgentSpec) -> tuple[list[SessionSummary], tuple[str, str] | None]:
         try:
-            sessions, result = await list_sessions(spec, timeout=timeout)
+            sessions = await pool.use(spec, lambda connection: connection.list_sessions(timeout=pool.timeout))
         except ViewerError as exc:
             return [], (spec.name, str(exc))
-        if not result.can_list:
-            return [], (spec.name, "不支持会话枚举（缺少 sessionCapabilities.list）")
         return sessions, None
 
     gathered = await asyncio.gather(*(one(spec) for spec in agents))
@@ -130,7 +135,7 @@ async def transcript_report(
     selector: str,
     agent_names: Sequence[str] | None,
     cwd: str | None,
-    timeout: float,
+    pool: AgentPool,
 ) -> TranscriptReport:
     """按选择器定位一条会话并重放它。"""
     try:
@@ -144,18 +149,16 @@ async def transcript_report(
         if not cwd.startswith("/"):
             raise ApiError(400, f"cwd 必须是绝对路径: {cwd!r}")
         summary = SessionSummary(agent=selected[0].name, session_id=selector, cwd=cwd, title=None, updated_at=None)
-        return await _load(selected[0], summary, timeout=timeout, matched=1, note="按 cwd 直接加载，未做枚举")
+        return await _load(selected[0], summary, pool=pool, matched=1, note="按 cwd 直接加载，未做枚举")
 
-    async def one(spec: AgentSpec) -> tuple[list[SessionSummary], str | None]:
+    async def lookup(spec: AgentSpec) -> tuple[list[SessionSummary], str | None]:
         try:
-            sessions, result = await list_sessions(spec, timeout=timeout)
+            sessions = await pool.use(spec, lambda connection: connection.list_sessions(timeout=pool.timeout))
         except ViewerError as exc:
             return [], str(exc)
-        if not result.can_list:
-            return [], "不支持会话枚举（缺少 sessionCapabilities.list）"
         return sessions, None
 
-    gathered = await asyncio.gather(*(one(spec) for spec in selected))
+    gathered = await asyncio.gather(*(lookup(spec) for spec in selected))
     matches: list[tuple[AgentSpec, SessionSummary]] = []
     problems: list[str] = []
     for spec, (sessions, error) in zip(selected, gathered):
@@ -175,19 +178,26 @@ async def transcript_report(
     note = None
     if len(matches) > 1:
         note = f"选择器命中 {len(matches)} 条会话，已取更新时间最新的一条"
-    return await _load(spec, summary, timeout=timeout, matched=len(matches), note=note)
+    return await _load(spec, summary, pool=pool, matched=len(matches), note=note)
 
 
 async def _load(
     spec: AgentSpec,
     summary: SessionSummary,
     *,
-    timeout: float,
+    pool: AgentPool,
     matched: int,
     note: str | None,
 ) -> TranscriptReport:
     try:
-        result, _probe = await load_transcript(spec, summary.session_id, summary.cwd, timeout=timeout)
+        result = await pool.use(
+            spec,
+            lambda connection: connection.load_transcript(
+                summary.session_id,
+                summary.cwd,
+                timeout=pool.timeout,
+            ),
+        )
     except ViewerError as exc:
         raise ApiError(502, f"加载会话 {summary.session_id} 失败: {exc}") from exc
     return TranscriptReport(

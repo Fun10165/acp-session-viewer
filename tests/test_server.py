@@ -6,6 +6,7 @@ import asyncio
 
 from aiohttp.test_utils import TestClient, TestServer
 
+from acp_session_viewer.agent_pool import AgentPool
 from acp_session_viewer.server import _session_json, build_app
 from acp_session_viewer.viewer import SessionSummary
 
@@ -13,7 +14,8 @@ TOKEN = "test-token-123"
 
 
 def _client():
-    app = build_app(token=TOKEN, agents=(), timeout=5.0, log_requests=False)
+    pool = AgentPool(timeout=5, idle_timeout=60, max_uses_per_connection=8)
+    app = build_app(token=TOKEN, agents=(), pool=pool, log_requests=False)
     return TestClient(TestServer(app))
 
 
