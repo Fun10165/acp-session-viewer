@@ -1,0 +1,78 @@
+# acp-view 配置示例
+#
+# 放到 ~/.config/acp-session-viewer/config.toml 即可自动生效，
+# 也可以用 `acp-view --config 路径` 指定。
+
+[server]
+# 绑定地址：IP 字面量（可选端口）或 localhost。默认只绑回环地址。
+bind = "127.0.0.1:8787"
+# 令牌文件与台账位置；不写就用默认位置：
+#   令牌 ~/.config/acp-session-viewer/token
+#   台账 ~/.local/share/acp-session-viewer/catalog.db
+# token_file = "~/.config/acp-session-viewer/token"
+# catalog = "~/.local/share/acp-session-viewer/catalog.db"
+# 单次 agent 操作超时
+timeout_secs = 180.0
+# 连接空闲多少秒后回收
+idle_timeout_secs = 300.0
+# 单条连接最多服务多少次操作后轮换
+max_uses_per_connection = 64
+
+# 会话文件定位规则：agent 名称 → 文件路径模式（`{id}` 会替换成会话 ID）。
+# 只有配置了规则的 agent 才有「文件大小 / 权限位 / 属主 / 文件时间」这些事实；
+# 定位不到时，依赖这些事实的规则一律判为不匹配。
+[server.locate]
+omp = ["~/.omp/agent/sessions/**/*{id}*.jsonl"]
+codex = ["~/.codex/sessions/**/*{id}*.jsonl", "~/.codex/archived_sessions/*{id}*.jsonl"]
+
+# 调用者身份（Linux 风格的权限模型里的「主体」）。
+# 省略时使用零配置默认主体：名称取服务端运行用户，令牌沿用单令牌解析结果。
+# [[principal]]
+# name = "fun10165"
+# token_file = "~/.config/acp-session-viewer/token"
+# groups = ["dev"]
+
+# 会话权限：属主 / 属组 / 模式位。位含义：r=读取内容，w=修改权限，x=列表可见。
+[acl.default]
+owner = "fun10165"
+group = "dev"
+# mode = "750"
+
+# 按会话覆盖权限（键写成 agent/会话 ID），优先级高于台账。
+# [acl.sessions."omp/01a0e148-3751-719a-997f-b253d58b1eae"]
+# mode = "400"
+
+# agent 注册表；整段省略时使用内置的 omp / opencode / codex / cursor / gemini。
+[[agent]]
+name = "omp"
+command = ["omp", "acp"]
+description = "omp 自带的 ACP 服务端"
+
+# 可见性策略：默认不暴露任何会话，由规则决定放行谁。
+[policy]
+default = "deny"
+# 被拒绝过的会话是否永久不再暴露（推荐保持 true）
+sticky_deny = true
+
+# 规则条件之间是「与」的关系；判定顺序是：历史拒绝 → deny 规则 → allow 规则 → 默认策略。
+
+[[policy.deny]]
+name = "涉密目录"
+cwd_glob = "**/secrets/**"
+
+[[policy.deny]]
+name = "他人可读的会话文件"
+# 文件权限位里其他用户可读（需要 [server.locate] 配好定位规则）
+other_readable = true
+
+[[policy.allow]]
+name = "点名放行"
+session_ids = ["01a0e148-3751-719a-997f-b253d58b1eae"]
+
+[[policy.allow]]
+name = "本机 omp 新会话"
+agents = ["omp"]
+# 只放行本规则首次生效之后才第一次见到的会话：
+#   "rule-created" 表示规则首次生效的时间；也可以写 RFC3339（2026-09-27T00:00:00Z）或相对时长（-7d、-24h）
+since = "rule-created"
+max_size = "8MiB"
