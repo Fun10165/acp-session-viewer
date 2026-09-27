@@ -60,6 +60,8 @@ pub struct SessionRecord {
     pub file_path: Option<PathBuf>,
     /// 会话权限（属主、属组、模式位）。
     pub acl: ObjectAcl,
+    /// 属主的来源：default（模板）、file（会话文件属主）、manual（chown 改过）。
+    pub acl_owner_source: String,
 }
 
 impl SessionRecord {
@@ -128,6 +130,27 @@ impl Catalog {
         })
     }
 
+    /// 老版本台账缺少的列在这里补齐（新建的库已经有全部列）。
+    fn ensure_columns(connection: &Connection) -> Result<(), CatalogError> {
+        let existing: Vec<String> = {
+            let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+            rows.filter_map(Result::ok).collect()
+        };
+        let wanted = [
+            ("acl_owner", "TEXT NOT NULL DEFAULT ''"),
+            ("acl_group", "TEXT"),
+            ("acl_mode", "INTEGER NOT NULL DEFAULT 493"),
+            ("acl_owner_source", "TEXT NOT NULL DEFAULT 'default'"),
+        ];
+        for (name, definition) in wanted {
+            if !existing.iter().any(|column| column == name) {
+                connection.execute_batch(&format!("ALTER TABLE sessions ADD COLUMN {name} {definition}"))?;
+            }
+        }
+        Ok(())
+    }
+
     fn prepare(connection: &Connection) -> Result<(), CatalogError> {
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -149,6 +172,8 @@ impl Catalog {
                  acl_owner TEXT NOT NULL,
                  acl_group TEXT,
                  acl_mode INTEGER NOT NULL,
+                 -- default = 来自模板，file = 取自会话文件属主，manual = chown 改过
+                 acl_owner_source TEXT NOT NULL DEFAULT 'default',
                  PRIMARY KEY (agent, session_id)
              );
              CREATE TABLE IF NOT EXISTS rules (
@@ -164,6 +189,7 @@ impl Catalog {
                  outcome TEXT NOT NULL
              );",
         )?;
+        Self::ensure_columns(connection)?;
         Ok(())
     }
 
@@ -239,8 +265,8 @@ impl Catalog {
         session_id: &str,
     ) -> Result<SessionRecord, CatalogError> {
         let row = connection.query_row(
-            "SELECT cwd, title, updated_at, first_seen, last_seen, decision, decided_at, rule, reason, file_path,
-                    acl_owner, acl_group, acl_mode
+                         "SELECT cwd, title, updated_at, first_seen, last_seen, decision, decided_at, rule, reason, file_path,
+                    acl_owner, acl_group, acl_mode, acl_owner_source
              FROM sessions WHERE agent = ?1 AND session_id = ?2",
             params![agent, session_id],
             |row| {
@@ -258,6 +284,7 @@ impl Catalog {
                     row.get::<_, String>(10)?,
                     row.get::<_, Option<String>>(11)?,
                     row.get::<_, i64>(12)?,
+                    row.get::<_, String>(13)?,
                 ))
             },
         )?;
@@ -273,6 +300,7 @@ impl Catalog {
             reason: row.8,
             file_path: row.9.map(PathBuf::from),
             acl: ObjectAcl::new(&row.10, row.11.as_deref(), row.12 as u16),
+            acl_owner_source: row.13,
         })
     }
 
@@ -345,8 +373,10 @@ impl Catalog {
         let connection = self.connection.lock();
         let mut affected = 0;
         if let Some(owner) = owner {
+            // 手工改属主后不再让会话文件覆盖它。
             affected += connection.execute(
-                "UPDATE sessions SET acl_owner = ?3 WHERE agent = ?1 AND session_id = ?2",
+                "UPDATE sessions SET acl_owner = ?3, acl_owner_source = 'manual'
+                 WHERE agent = ?1 AND session_id = ?2",
                 params![agent, session_id, owner],
             )?;
         }
@@ -382,6 +412,17 @@ impl Catalog {
             )
             .optional()?;
         Ok(exists.is_some())
+    }
+
+    /// 按会话文件属主设置会话属主（只在属主还来自模板时生效）。
+    pub fn set_owner_from_file(&self, agent: &str, session_id: &str, owner: &str) -> Result<bool, CatalogError> {
+        let connection = self.connection.lock();
+        let affected = connection.execute(
+            "UPDATE sessions SET acl_owner = ?3, acl_owner_source = 'file'
+             WHERE agent = ?1 AND session_id = ?2 AND acl_owner_source = 'default'",
+            params![agent, session_id, owner],
+        )?;
+        Ok(affected > 0)
     }
 
     /// 记住会话文件的路径。

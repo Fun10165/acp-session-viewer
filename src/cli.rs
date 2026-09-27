@@ -326,13 +326,22 @@ fn write_secret(path: &Path, value: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// 配置里没写组时到系统账号里查；查不到就用空集合（组位自然不匹配）。
+fn groups_or_system(name: &str, configured: &[String]) -> Vec<String> {
+    if !configured.is_empty() {
+        return configured.to_vec();
+    }
+    crate::system::user_groups(name).unwrap_or_default()
+}
+
 /// 组装令牌到主体的映射：配置了 [[principal]] 时只用配置里的令牌，否则用单令牌 + 默认主体。
+///
+/// 主体的组按「配置优先、缺省查系统」确定。
 fn resolve_principals(config: &Config, fallback_token: &str) -> Result<Vec<(String, Principal)>, String> {
     if config.principal.is_empty() {
-        return Ok(vec![(
-            fallback_token.to_string(),
-            Principal::new(&Config::default_principal_name(), Vec::new()),
-        )]);
+        let name = Config::default_principal_name();
+        let groups = groups_or_system(&name, &[]);
+        return Ok(vec![(fallback_token.to_string(), Principal::new(&name, groups))]);
     }
     let mut list = Vec::new();
     for entry in &config.principal {
@@ -347,7 +356,8 @@ fn resolve_principals(config: &Config, fallback_token: &str) -> Result<Vec<(Stri
         if token.is_empty() {
             return Err(format!("主体 {:?} 的令牌为空", entry.name));
         }
-        list.push((token, Principal::new(&entry.name, entry.groups.clone())));
+        let groups = groups_or_system(&entry.name, &entry.groups);
+        list.push((token, Principal::new(&entry.name, groups)));
     }
     Ok(list)
 }

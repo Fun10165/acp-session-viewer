@@ -220,6 +220,8 @@ pub struct Service {
     default_acl: ObjectAcl,
     /// 配置里对具体会话的权限覆盖（键为 `agent/会话 ID`）。
     acl_overrides: std::collections::BTreeMap<String, ObjectAcl>,
+    /// 会话文件索引缓存：agent → （建立时间, 文件名与路径）。
+    file_indexes: parking_lot::Mutex<std::collections::BTreeMap<String, (std::time::Instant, Arc<Vec<(String, PathBuf)>>)>>,
 }
 
 impl Service {
@@ -261,7 +263,66 @@ impl Service {
             current_uid,
             default_acl,
             acl_overrides,
+            file_indexes: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
         })
+    }
+
+    /// 某个 agent 的会话文件索引（文件名 → 路径），60 秒内复用。
+    fn file_index(&self, agent: &str) -> Arc<Vec<(String, PathBuf)>> {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(60);
+        {
+            let guard = self.file_indexes.lock();
+            if let Some((built, index)) = guard.get(agent) {
+                if built.elapsed() < TTL {
+                    return Arc::clone(index);
+                }
+            }
+        }
+        let patterns = self.config.server.locate.get(agent).cloned().unwrap_or_default();
+        let mut entries: Vec<(String, PathBuf)> = Vec::new();
+        for pattern in &patterns {
+            // 把 {id} 换成通配符，一次遍历建好整个索引，避免每条会话都走一遍目录。
+            let expanded = locate::index_pattern(pattern);
+            let Ok(expanded) = crate::config::expand_home(Path::new(&expanded)) else {
+                continue;
+            };
+            let Ok(paths) = glob::glob(&expanded.to_string_lossy()) else {
+                continue;
+            };
+            for path in paths.flatten() {
+                if !path.is_file() {
+                    continue;
+                }
+                let name = path
+                    .file_name()
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                entries.push((name, path));
+            }
+        }
+        let index = Arc::new(entries);
+        self.file_indexes
+            .lock()
+            .insert(agent.to_string(), (std::time::Instant::now(), Arc::clone(&index)));
+        index
+    }
+
+    /// 找到会话文件并读出它的属主名字。
+    fn owner_from_file(&self, agent: &str, session_id: &str, cached: Option<&Path>) -> Option<(PathBuf, String)> {
+        let path = match cached {
+            Some(path) if path.is_file() => path.to_path_buf(),
+            _ => {
+                let index = self.file_index(agent);
+                index
+                    .iter()
+                    .find(|(name, _)| name.contains(session_id))
+                    .map(|(_, path)| path.clone())?
+            }
+        };
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::metadata(&path).ok()?;
+        let owner = crate::system::user_name(metadata.uid())?;
+        Some((path, owner))
     }
 
     /// 取会话权限：配置覆盖优先，其次是台账里记录的值，最后是默认模板。
@@ -655,7 +716,7 @@ impl Service {
     }
 
     /// 读取一条会话的权限与来源（配置文件覆盖 或 台账）。
-    pub fn acl_status(&self, agent: &str, session_id: &str) -> Result<(ObjectAcl, &'static str), ServiceError> {
+    pub fn acl_status(&self, agent: &str, session_id: &str) -> Result<(ObjectAcl, String), ServiceError> {
         let record = self
             .catalog
             .session(agent, session_id)?
@@ -665,9 +726,14 @@ impl Service {
             })?;
         let key = format!("{agent}/{session_id}");
         if let Some(acl) = self.acl_overrides.get(&key) {
-            return Ok((acl.clone(), "配置文件覆盖"));
+            return Ok((acl.clone(), "配置文件覆盖".to_string()));
         }
-        Ok((record.acl, "台账"))
+        let owner_source = match record.acl_owner_source.as_str() {
+            "file" => "会话文件属主",
+            "manual" => "手工修改",
+            _ => "默认模板",
+        };
+        Ok((record.acl, format!("台账（属主来源：{owner_source}）")))
     }
 
     /// 修改权限位。
@@ -785,7 +851,23 @@ impl Service {
             &initial_acl,
             now,
         )?;
-        let acl = self.acl_for(&spec.name, &summary.session_id, Some(&record.acl));
+        let mut acl = self.acl_for(&spec.name, &summary.session_id, Some(&record.acl));
+        // 属主默认来自模板；能定位到会话文件时改用文件属主（配置覆盖与 chown 过的都保持原样）。
+        let override_key = format!("{}/{}", spec.name, summary.session_id);
+        if record.acl_owner_source == "default" && !self.acl_overrides.contains_key(&override_key) {
+            if let Some((path, owner)) =
+                self.owner_from_file(&spec.name, &summary.session_id, record.file_path.as_deref())
+            {
+                // 记录来源，之后就不再重复解析；chown 过的（source=manual）不会被覆盖。
+                let _ = self
+                    .catalog
+                    .set_owner_from_file(&spec.name, &summary.session_id, &owner);
+                let _ = self
+                    .catalog
+                    .remember_file_path(&spec.name, &summary.session_id, &path);
+                acl.owner = owner;
+            }
+        }
         let acl_decision = acl_check(principal, &acl, access);
         let file = self.file_facts(&spec.name, &summary.session_id, record.file_path.as_deref());
         let facts = SessionFacts {

@@ -15,6 +15,7 @@ dependencies = [
  "getrandom",
  "glob",
  "globset",
+ "libc",
  "parking_lot",
  "reqwest",
  "rusqlite",

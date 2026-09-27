@@ -35,6 +35,36 @@ pub fn find_file(patterns: &[String], session_id: &str) -> Option<PathBuf> {
     None
 }
 
+/// 把定位模式改写成用于建立索引的 glob：`{id}` 换成 `*`，
+/// 并把同一路径段里连续的通配符合并成一个（`**` 作为整段时保留）。
+#[must_use]
+pub fn index_pattern(pattern: &str) -> String {
+    let replaced = pattern.replace("{id}", "*");
+    let mut result = String::with_capacity(replaced.len());
+    for (index, segment) in replaced.split('/').enumerate() {
+        if index > 0 {
+            result.push('/');
+        }
+        if segment == "**" {
+            result.push_str("**");
+            continue;
+        }
+        let mut last_star = false;
+        for character in segment.chars() {
+            if character == '*' {
+                if last_star {
+                    continue;
+                }
+                last_star = true;
+            } else {
+                last_star = false;
+            }
+            result.push(character);
+        }
+    }
+    result
+}
+
 fn expand(pattern: &str, session_id: &str) -> Result<String, ()> {
     let with_id = pattern.replace("{id}", session_id);
     let home = crate::config::home_dir().ok_or(())?;
@@ -88,6 +118,18 @@ mod tests {
         assert_eq!(find_file(&patterns, "不存在的会话"), None);
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn 索引模式会合并连续通配符() {
+        assert_eq!(
+            index_pattern("~/.omp/agent/sessions/**/*{id}*.jsonl"),
+            "~/.omp/agent/sessions/**/*.jsonl"
+        );
+        assert_eq!(index_pattern("~/.codex/sessions/**/*{id}*.jsonl"), "~/.codex/sessions/**/*.jsonl");
+        assert_eq!(index_pattern("~/.codex/archived_sessions/*{id}*.jsonl"), "~/.codex/archived_sessions/*.jsonl");
+        // 没有 {id} 的模式保持原样
+        assert_eq!(index_pattern("~/.x/**/*.jsonl"), "~/.x/**/*.jsonl");
     }
 
     #[test]
