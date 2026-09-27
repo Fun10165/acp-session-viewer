@@ -1,0 +1,21 @@
+[project]
+name = "acp-session-viewer"
+version = "0.1.0"
+description = "用 ACP 协议只读查看各家 coding agent 的会话"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "agent-client-protocol>=0.12.1",
+]
+
+[project.scripts]
+acp-view = "acp_session_viewer.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
